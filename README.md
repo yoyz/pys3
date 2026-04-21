@@ -25,12 +25,12 @@ $ mv pys3 /usr/local/bin/pys3
 
 ## Configuration
 
-pys3 uses an INI-style configuration file located at \~/.pys3 to manage multiple bucket profiles.
+pys3 uses an INI-style configuration file located at ~/.pys3 to manage multiple bucket profiles.
 
 To generate a default template, run the following command:
 
 ```bash
-$ pys3 --generate-config \> \~/.pys3
+$ pys3 --generate-config > ~/.pys3
 ```
 
 
@@ -90,7 +90,9 @@ Note: You can use the TAB key at any time to auto-complete remote object names o
 
 You can also pass commands directly to pys3 without entering the interactive shell. This is highly useful for automated bash scripts:
 
+```bash
 $ pys3 --profile radosgw ls -lh
 $ pys3 --profile radosgw mkdir backups/
 $ pys3 --profile radosgw put local-archive.tar.gz backups/archive.tar.gz
 $ pys3 --profile radosgw get backups/archive.tar.gz
+```
