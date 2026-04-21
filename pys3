@@ -3,6 +3,7 @@
 import os
 import sys
 import cmd
+import ssl
 import time
 import glob
 import json
@@ -17,8 +18,6 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
-
-CONFIG_FILE = os.path.expanduser('~/.pys3')
 
 def format_speed(bytes_count, seconds):
     """Helper to calculate and format bandwidth speeds."""
@@ -44,8 +43,9 @@ def format_size(bytes_count):
 
 class S3SigV4Client:
     """A lightweight S3 client using standard libraries and AWS Signature V4."""
-    def __init__(self, endpoint, region, access_key, secret_key, bucket):
+    def __init__(self, endpoint, region, access_key, secret_key, bucket, tls_verify=True):
         self.endpoint = endpoint.rstrip('/')
+        self.tls_verify = tls_verify
         
         # Auto-correct missing HTTP/HTTPS scheme
         if not self.endpoint.startswith(('http://', 'https://')):
@@ -102,16 +102,26 @@ class S3SigV4Client:
         if qs:
             url += f"?{qs}"
 
+        # Handle TLS verification bypass
+        ctx = None
+        if not self.tls_verify:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
         try:
             req = urllib.request.Request(url, data=payload if payload else None, headers=headers, method=method)
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
                 return response.read(), response.status
         except urllib.error.HTTPError as e:
             return e.read(), e.code
         except urllib.error.URLError as e:
             print(f"\n[ERROR] Network issue connecting to {self.endpoint}")
             print(f"Reason: {e.reason}")
-            print("Please check your DNS resolution and ensure the endpoint is reachable.")
+            if "CERTIFICATE_VERIFY_FAILED" in str(e.reason):
+                print("Tip: If this is a self-signed certificate, you can bypass this check using --tls-verify=false")
+            else:
+                print("Please check your DNS resolution and ensure the endpoint is reachable.")
             return b'', None
         except ValueError as e:
             print(f"\n[ERROR] Invalid URL formatting: {e}")
@@ -135,12 +145,10 @@ class S3SigV4Client:
             
             results = []
             
-            # Simulated directories (from delimiter)
             for cp in root.findall('.//s3:CommonPrefixes' if ns else './/CommonPrefixes', ns):
                 p = cp.find('s3:Prefix' if ns else 'Prefix', ns).text
                 results.append({'key': p, 'size': 0, 'is_dir': True})
             
-            # Actual objects
             for c in root.findall('.//s3:Contents' if ns else './/Contents', ns):
                 key = c.find('s3:Key' if ns else 'Key', ns).text
                 size = int(c.find('s3:Size' if ns else 'Size', ns).text)
@@ -208,20 +216,17 @@ class PyS3Shell(cmd.Cmd):
         self.prefix = ""
         self.update_prompt()
         
-        # Configure readline to NOT split words on slashes (/) for path completion
         try:
             import readline
             readline.set_completer_delims(' \t\n;')
         except ImportError:
-            pass # Windows or system without readline
+            pass
 
     def update_prompt(self):
         display_prefix = f"/{self.prefix}" if self.prefix else "/"
         self.prompt = f"pys3 ({self.client.bucket}{display_prefix})> "
 
-    # --- COMPLETION HELPERS ---
     def _complete_remote(self, text, line, is_dir_only=False):
-        """Helper to fetch S3 completion matches based on user input."""
         if '/' in text:
             dir_part = text[:text.rfind('/')+1]
             file_part = text[text.rfind('/')+1:]
@@ -230,8 +235,6 @@ class PyS3Shell(cmd.Cmd):
             file_part = text
             
         search_prefix = self.prefix + dir_part
-        
-        # Use silent=True so background tab-completion doesn't print S3 errors to screen
         objects = self.client.list_objects(prefix=search_prefix, delimiter='/', silent=True)
             
         completions = []
@@ -239,17 +242,14 @@ class PyS3Shell(cmd.Cmd):
             key = obj['key']
             if key == search_prefix:
                 continue
-                
             rel_name = key[len(search_prefix):]
             if rel_name.startswith(file_part):
                 if is_dir_only and not obj['is_dir']:
                     continue
                 completions.append(dir_part + rel_name)
-                
         return completions
 
     def _complete_local(self, text, line):
-        """Helper to fetch local filesystem completion matches."""
         path = text + '*'
         matches = glob.glob(path)
         completions = []
@@ -260,119 +260,78 @@ class PyS3Shell(cmd.Cmd):
                 completions.append(m)
         return completions
 
-    # --- TAB COMPLETION HOOKS ---
-    def complete_cd(self, text, line, begidx, endidx):
-        return self._complete_remote(text, line, is_dir_only=True)
-
-    def complete_ls(self, text, line, begidx, endidx):
-        if text.startswith('-'): return []
-        return self._complete_remote(text, line)
-        
-    def complete_find(self, text, line, begidx, endidx):
-        return self._complete_remote(text, line)
-        
-    def complete_mkdir(self, text, line, begidx, endidx):
-        return self._complete_remote(text, line, is_dir_only=True)
-        
-    def complete_cat(self, text, line, begidx, endidx):
-        return self._complete_remote(text, line)
+    def complete_cd(self, text, line, begidx, endidx): return self._complete_remote(text, line, is_dir_only=True)
+    def complete_ls(self, text, line, begidx, endidx): return [] if text.startswith('-') else self._complete_remote(text, line)
+    def complete_find(self, text, line, begidx, endidx): return self._complete_remote(text, line)
+    def complete_mkdir(self, text, line, begidx, endidx): return self._complete_remote(text, line, is_dir_only=True)
+    def complete_cat(self, text, line, begidx, endidx): return self._complete_remote(text, line)
 
     def complete_get(self, text, line, begidx, endidx):
         args = line.split()
-        if len(args) == 2 and line.endswith(' '): # Typing the 2nd arg (local file)
-            return self._complete_local(text, line)
-        elif len(args) > 2: # Already typed 2nd arg
-            return self._complete_local(text, line)
-        else: # Completing 1st arg (remote file)
-            return self._complete_remote(text, line)
+        if len(args) == 2 and line.endswith(' '): return self._complete_local(text, line)
+        elif len(args) > 2: return self._complete_local(text, line)
+        else: return self._complete_remote(text, line)
 
     def complete_put(self, text, line, begidx, endidx):
         args = line.split()
-        if len(args) == 2 and line.endswith(' '): # Typing 2nd arg (remote location)
-            return self._complete_remote(text, line)
-        elif len(args) > 2: # Already typed 2nd arg
-            return self._complete_remote(text, line)
-        else: # Completing 1st arg (local file)
-            return self._complete_local(text, line)
+        if len(args) == 2 and line.endswith(' '): return self._complete_remote(text, line)
+        elif len(args) > 2: return self._complete_remote(text, line)
+        else: return self._complete_local(text, line)
 
-    # --- COMMANDS ---
     def do_find(self, arg):
-        """Recursively list all objects under the current prefix (like old ls)."""
         search_prefix = self.prefix + arg if arg else self.prefix
-        objects = self.client.list_objects(prefix=search_prefix) # No delimiter = recursive
+        objects = self.client.list_objects(prefix=search_prefix)
         for obj in objects:
             key = obj['key']
             display_name = key[len(self.prefix):] if key.startswith(self.prefix) else key
             print(display_name)
 
     def do_ls(self, arg):
-        """List contents of the current directory. Options: -l, -h, -lh"""
         show_long = '-l' in arg
         show_human = '-h' in arg or '-lh' in arg or '-hl' in arg
-        if '-lh' in arg or '-hl' in arg:
-            show_long = True
+        if '-lh' in arg or '-hl' in arg: show_long = True
             
         clean_arg = arg.replace('-lh', '').replace('-hl', '').replace('-l', '').replace('-h', '').strip()
-        
         search_prefix = self.prefix + clean_arg if clean_arg else self.prefix
         if search_prefix and not search_prefix.endswith('/') and clean_arg:
             search_prefix += '/'
 
         objects = self.client.list_objects(prefix=search_prefix, delimiter='/')
-        
         for obj in objects:
             key = obj['key']
-            if key == search_prefix:
-                continue
-                
+            if key == search_prefix: continue
             display_name = key[len(search_prefix):] if key.startswith(search_prefix) else key
-            
             if show_long:
-                if obj['is_dir']:
-                    print(f"{'DIR':>10}  {display_name}")
-                else:
-                    size_str = format_size(obj['size']) if show_human else str(obj['size'])
-                    print(f"{size_str:>10}  {display_name}")
+                if obj['is_dir']: print(f"{'DIR':>10}  {display_name}")
+                else: print(f"{format_size(obj['size']) if show_human else str(obj['size']):>10}  {display_name}")
             else:
                 print(display_name)
 
     def do_cd(self, arg):
-        """Change directory (prefix). Use 'cd /' to go to root."""
-        if not arg or arg == '/':
-            self.prefix = ""
+        if not arg or arg == '/': self.prefix = ""
         elif arg == '..':
             parts = [p for p in self.prefix.split('/') if p]
             self.prefix = '/'.join(parts[:-1]) + '/' if len(parts) > 1 else ""
         else:
             new_prefix = self.prefix + arg
-            if not new_prefix.endswith('/'):
-                new_prefix += '/'
+            if not new_prefix.endswith('/'): new_prefix += '/'
             self.prefix = new_prefix
         self.update_prompt()
 
     def do_mkdir(self, arg):
-        """Create a directory (S3 prefix): mkdir <dirname>"""
         if not arg:
             print("Usage: mkdir <dirname>")
             return
         dirname = arg.strip()
-        if not dirname.endswith('/'):
-            dirname += '/'
+        if not dirname.endswith('/'): dirname += '/'
         remote_key = self.prefix + dirname
-        
         data, status = self.client.make_request('PUT', remote_key, payload=b'')
-        if status is None:
-            return
-            
-        if status == 200:
-            print(f"Created directory: {remote_key}")
-        elif status == 403:
-            print(f"Error 403: Access Denied to create '{remote_key}'.")
-        else:
-            print(f"Error creating directory {remote_key}: HTTP {status}")
+        if status is None: return
+        if status == 200: print(f"Created directory: {remote_key}")
+        elif status == 403: print(f"Error 403: Access Denied to create '{remote_key}'.")
+        else: print(f"Error creating directory {remote_key}: HTTP {status}")
 
     def do_get(self, arg):
-        """Download an object: get <remote_key> [local_path]"""
         args = arg.split()
         if not args:
             print("Usage: get <remote_key> [local_path]")
@@ -382,7 +341,6 @@ class PyS3Shell(cmd.Cmd):
         self.client.download_file(remote_key, local_path)
 
     def do_put(self, arg):
-        """Upload a local file: put <local_path> [remote_key]"""
         args = arg.split()
         if not args:
             print("Usage: put <local_path> [remote_key]")
@@ -392,29 +350,20 @@ class PyS3Shell(cmd.Cmd):
         self.client.upload_file(local_path, remote_key)
         
     def do_cat(self, arg):
-        """Print the contents of a remote file to the terminal: cat <remote_key>"""
         if not arg:
             print("Usage: cat <remote_key>")
             return
         remote_key = self.prefix + arg.strip()
         data, status = self.client.make_request('GET', remote_key)
-        if status is None:
-            return
-            
+        if status is None: return
         if status == 200:
-            try:
-                print(data.decode('utf-8'))
-            except UnicodeDecodeError:
-                print(f"Error: '{remote_key}' appears to be binary and cannot be printed.")
-        elif status == 403:
-            print(f"Error 403: Access Denied to '{remote_key}'.")
-        elif status == 404:
-            print(f"Error 404: File '{remote_key}' not found.")
-        else:
-            print(f"Error reading {remote_key}: HTTP {status}")
+            try: print(data.decode('utf-8'))
+            except UnicodeDecodeError: print(f"Error: '{remote_key}' appears to be binary and cannot be printed.")
+        elif status == 403: print(f"Error 403: Access Denied to '{remote_key}'.")
+        elif status == 404: print(f"Error 404: File '{remote_key}' not found.")
+        else: print(f"Error reading {remote_key}: HTTP {status}")
 
     def do_exit(self, arg):
-        """Exit the shell."""
         print("Goodbye!")
         return True
     
@@ -423,15 +372,16 @@ class PyS3Shell(cmd.Cmd):
         return True
 
 
-def show_default_config():
+def show_default_config(config_path):
     print(f"""
-# Save this template to {CONFIG_FILE}
+# Save this template to {config_path}
 [default]
 endpoint = https://s3.amazonaws.com
 region = us-east-1
 access_key = YOUR_ACCESS_KEY
 secret_key = YOUR_SECRET_KEY
 bucket = your-bucket-name
+tls_verify = true
 
 [radosgw]
 endpoint = http://127.0.0.1:8080
@@ -441,8 +391,9 @@ secret_key = YOUR_SECRET_KEY
 bucket = your-bucket-name
 """)
 
-def generate_config_from_obc(obc_name):
+def generate_config_from_obc(obc_name, config_path):
     try:
+        print(f"[*] Extracting OpenShift resources for OBC '{obc_name}'...", file=sys.stderr)
         sec_out = subprocess.check_output(['oc', 'get', 'secret', obc_name, '-o', 'json'], stderr=subprocess.DEVNULL)
         sec_data = json.loads(sec_out).get('data', {})
         access_key = base64.b64decode(sec_data.get('AWS_ACCESS_KEY_ID', b'')).decode()
@@ -455,72 +406,113 @@ def generate_config_from_obc(obc_name):
         port = cm_data.get('BUCKET_PORT', '443')
         region = cm_data.get('BUCKET_REGION', 'us-east-1')
         
-        scheme = 'https' if port == '443' else 'http'
-        endpoint = f"{scheme}://{host}:{port}"
+        print(f"[*] Base OBC host found: {host}", file=sys.stderr)
 
-        print(f"[{obc_name}]")
+        # Smart route resolution
+        if '.svc' in host:
+            parts = host.split('.')
+            svc_name = parts[0]
+            svc_ns = parts[1] if len(parts) > 1 else 'default'
+            
+            print(f"[*] Internal service detected. Attempting to find external route for service '{svc_name}' in namespace '{svc_ns}'...", file=sys.stderr)
+            try:
+                route_out = subprocess.check_output(['oc', 'get', 'route', '-n', svc_ns, '-o', 'json'], stderr=subprocess.DEVNULL)
+                routes = json.loads(route_out).get('items', [])
+                external_host = None
+                
+                for r in routes:
+                    # Check if route targets our service
+                    if r.get('spec', {}).get('to', {}).get('name') == svc_name:
+                        external_host = r.get('spec', {}).get('host')
+                        break
+                        
+                if external_host:
+                    print(f"[*] Success! Found external route: {external_host}", file=sys.stderr)
+                    host = external_host
+                    port = '443'
+                else:
+                    print(f"[*] No external route found targeting service '{svc_name}'. Using internal host.", file=sys.stderr)
+            except Exception as e:
+                print(f"[*] Failed to query routes (you may lack permissions): {e}", file=sys.stderr)
+        
+        scheme = 'https' if port == '443' else 'http'
+        endpoint = f"{scheme}://{host}:{port}" if port not in ['80', '443'] else f"{scheme}://{host}"
+
+        print(f"\n[{obc_name}]")
         print(f"endpoint = {endpoint}")
         print(f"region = {region}")
         print(f"access_key = {access_key}")
         print(f"secret_key = {secret_key}")
         print(f"bucket = {bucket}")
-        print(f"# Append the block above to your {CONFIG_FILE}")
+        print(f"# Append the block above to your {config_path}")
+        print(f"[*] Output generation complete.", file=sys.stderr)
+        
     except subprocess.CalledProcessError:
-        print(f"Error: Could not retrieve OpenShift OBC '{obc_name}'. Ensure you are logged in via 'oc login'.")
+        print(f"Error: Could not retrieve OpenShift OBC '{obc_name}'. Ensure you are logged in via 'oc login'.", file=sys.stderr)
     except Exception as e:
-        print(f"Error processing OBC config: {e}")
+        print(f"Error processing OBC config: {e}", file=sys.stderr)
 
 def main():
     parser = argparse.ArgumentParser(description="pys3: A standard-library only interactive S3 client.")
-    parser.add_argument('--profile', type=str, help="Configuration profile to use from ~/.pys3")
+    parser.add_argument('-f', '--file', type=str, default=os.path.expanduser('~/.pys3'), help="Path to the configuration file (defaults to ~/.pys3)")
+    parser.add_argument('--profile', type=str, help="Configuration profile to use")
     parser.add_argument('--generate-config', action='store_true', help="Show a default configuration template")
     parser.add_argument('--from-obc', type=str, metavar='OBC_NAME', help="Grab credentials from an OpenShift OBC and output config block")
+    parser.add_argument('--tls-verify', type=str, choices=['true', 'false'], default='true', help="Set to 'false' to disable SSL certificate verification")
     parser.add_argument('command', nargs='*', help="Command to execute directly (e.g. ls, get, put, mkdir). If empty, starts shell.")
     
     args = parser.parse_args()
+    config_path = args.file
 
     if args.generate_config:
-        show_default_config()
+        show_default_config(config_path)
         sys.exit(0)
 
     if args.from_obc:
-        generate_config_from_obc(args.from_obc)
+        generate_config_from_obc(args.from_obc, config_path)
         sys.exit(0)
 
-    if not os.path.exists(CONFIG_FILE):
-        print(f"No configuration file found at {CONFIG_FILE}.\n")
+    if not os.path.exists(config_path):
+        print(f"No configuration file found at {config_path}.\n")
         print("To create a default configuration profile, run the following command:")
-        print(f"    {sys.argv[0]} --generate-config > {CONFIG_FILE}")
+        print(f"    {sys.argv[0]} -f {config_path} --generate-config > {config_path}")
         sys.exit(1)
 
     config = configparser.ConfigParser()
-    config.read(CONFIG_FILE)
+    config.read(config_path)
     profiles = config.sections()
 
     if not profiles:
-        print(f"The configuration file {CONFIG_FILE} exists but contains no profiles.\n")
-        print(f"Run '{sys.argv[0]} --generate-config' to see an example of how to format it.")
+        print(f"The configuration file {config_path} exists but contains no profiles.\n")
+        print(f"Run '{sys.argv[0]} -f {config_path} --generate-config' to see an example of how to format it.")
         sys.exit(1)
 
     if not args.profile:
-        print("No profile specified. Available profiles in your configuration:")
+        print(f"No profile specified. Available profiles in your configuration ({config_path}):")
         for p in profiles:
             print(f"  - {p}")
-        print(f"\nPlease select one using: {sys.argv[0]} --profile <profile_name> [command]")
+        print(f"\nPlease select one using: {sys.argv[0]} -f {config_path} --profile <profile_name> [command]")
         sys.exit(1)
 
     if args.profile not in config:
-        print(f"Error: Profile '{args.profile}' not found in {CONFIG_FILE}.")
+        print(f"Error: Profile '{args.profile}' not found in {config_path}.")
         sys.exit(1)
 
     c = config[args.profile]
+    
+    # Check config file first, override with CLI if CLI explicitly passed 'false'
+    tls_verify = c.getboolean('tls_verify', True)
+    if args.tls_verify == 'false':
+        tls_verify = False
+
     try:
         client = S3SigV4Client(
             endpoint=c['endpoint'],
             region=c.get('region', ''),
             access_key=c['access_key'],
             secret_key=c['secret_key'],
-            bucket=c['bucket']
+            bucket=c['bucket'],
+            tls_verify=tls_verify
         )
     except KeyError as e:
         print(f"Missing required configuration key {e} in profile '{args.profile}'")
