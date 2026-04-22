@@ -130,6 +130,31 @@ class S3SigV4Client:
             print(f"\n[ERROR] An unexpected error occurred: {e}")
             return b'', None
 
+    def check_connection(self):
+        """Perform a dummy request to validate credentials, DNS, and TLS before starting the shell."""
+        query = {'list-type': '2', 'max-keys': '1'}
+        data, status = self.make_request('GET', '', query)
+        
+        if status is None:
+            return False # Network or URLError already printed
+            
+        if status == 403:
+            print("\n[ERROR] Connection reached the server, but Access Denied (403).")
+            print("Please check your access_key and secret_key.")
+            return False
+        if status == 404:
+            print(f"\n[ERROR] The bucket '{self.bucket}' was not found (404).")
+            return False
+        if status not in [200, 204]:
+            print(f"\n[WARNING] Connection check returned unexpected HTTP {status}.")
+            try:
+                print(data.decode('utf-8', errors='ignore'))
+            except:
+                pass
+            return False
+            
+        return True
+
     def list_objects(self, prefix="", delimiter="", silent=False):
         query = {'list-type': '2'}
         if prefix: query['prefix'] = prefix
@@ -444,6 +469,7 @@ def generate_config_from_obc(obc_name, config_path):
         print(f"access_key = {access_key}")
         print(f"secret_key = {secret_key}")
         print(f"bucket = {bucket}")
+        print(f"tls_verify = true")
         print(f"# Append the block above to your {config_path}")
         print(f"[*] Output generation complete.", file=sys.stderr)
         
@@ -458,7 +484,7 @@ def main():
     parser.add_argument('--profile', type=str, help="Configuration profile to use")
     parser.add_argument('--generate-config', action='store_true', help="Show a default configuration template")
     parser.add_argument('--from-obc', type=str, metavar='OBC_NAME', help="Grab credentials from an OpenShift OBC and output config block")
-    parser.add_argument('--tls-verify', type=str, choices=['true', 'false'], default='true', help="Set to 'false' to disable SSL certificate verification")
+    parser.add_argument('--tls-verify', type=str, choices=['true', 'false'], help="Override TLS verification setting")
     parser.add_argument('command', nargs='*', help="Command to execute directly (e.g. ls, get, put, mkdir). If empty, starts shell.")
     
     args = parser.parse_args()
@@ -475,7 +501,10 @@ def main():
     if not os.path.exists(config_path):
         print(f"No configuration file found at {config_path}.\n")
         print("To create a default configuration profile, run the following command:")
-        print(f"    {sys.argv[0]} -f {config_path} --generate-config > {config_path}")
+        if config_path == os.path.expanduser('~/.pys3'):
+            print(f"    {sys.argv[0]} --generate-config > {config_path}")
+        else:
+            print(f"    {sys.argv[0]} -f {config_path} --generate-config > {config_path}")
         sys.exit(1)
 
     config = configparser.ConfigParser()
@@ -488,11 +517,15 @@ def main():
         sys.exit(1)
 
     if not args.profile:
-        print(f"No profile specified. Available profiles in your configuration ({config_path}):")
-        for p in profiles:
-            print(f"  - {p}")
-        print(f"\nPlease select one using: {sys.argv[0]} -f {config_path} --profile <profile_name> [command]")
-        sys.exit(1)
+        if len(profiles) == 1:
+            args.profile = profiles[0]
+            print(f"[*] Auto-selected only available profile: {args.profile}")
+        else:
+            print(f"No profile specified. Available profiles in your configuration ({config_path}):")
+            for p in profiles:
+                print(f"  - {p}")
+            print(f"\nPlease select one using: {sys.argv[0]} -f {config_path} --profile <profile_name> [command]")
+            sys.exit(1)
 
     if args.profile not in config:
         print(f"Error: Profile '{args.profile}' not found in {config_path}.")
@@ -500,10 +533,18 @@ def main():
 
     c = config[args.profile]
     
-    # Check config file first, override with CLI if CLI explicitly passed 'false'
-    tls_verify = c.getboolean('tls_verify', True)
+    # Allow both tls_verify and tls-verify in the config file
+    tls_verify = True
+    if 'tls_verify' in c:
+        tls_verify = c.getboolean('tls_verify')
+    elif 'tls-verify' in c:
+        tls_verify = c.getboolean('tls-verify')
+        
+    # CLI argument overrides config file
     if args.tls_verify == 'false':
         tls_verify = False
+    elif args.tls_verify == 'true':
+        tls_verify = True
 
     try:
         client = S3SigV4Client(
@@ -516,6 +557,11 @@ def main():
         )
     except KeyError as e:
         print(f"Missing required configuration key {e} in profile '{args.profile}'")
+        sys.exit(1)
+
+    # Perform pre-flight connection check
+    print(f"[*] Verifying connection to {client.endpoint}...")
+    if not client.check_connection():
         sys.exit(1)
 
     shell = PyS3Shell(client)
